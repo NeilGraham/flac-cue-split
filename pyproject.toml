@@ -1,0 +1,12 @@
+[project]
+name = "flac-cue-split"
+version = "0.1.0"
+description = "Split FLAC files into individual tracks based on CUE sheets"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "rich>=14.3.1",
+]
+
+[project.scripts]
+flac-cue-split = "main:main"
