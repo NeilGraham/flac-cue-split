@@ -17,7 +17,6 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-from rich.table import Table
 from rich.theme import Theme
 
 theme = Theme({
@@ -48,12 +47,14 @@ class Track:
         frames = int(parts[2]) if len(parts) > 2 else 0
         return minutes * 60 + seconds + frames / 75.0
 
-    def safe_filename(self) -> str:
+    def safe_filename(self, total_tracks: int = 99) -> str:
         """Generate a safe filename for this track."""
         # Remove or replace characters that are problematic in filenames
         safe_title = re.sub(r'[<>:"/\\|?*]', '_', self.title)
         safe_title = safe_title.strip('. ')
-        return f"{self.number:02d} - {safe_title}.flac"
+        # Pad track number based on total tracks (minimum 2 digits)
+        width = max(2, len(str(total_tracks)))
+        return f"{self.number:0{width}d}. {safe_title}.flac"
 
 
 @dataclass
@@ -78,11 +79,11 @@ def parse_cue_file(cue_path: Path) -> CueSheet | None:
                 continue
 
         if content is None:
-            print(f"  WARNING: Could not decode {cue_path}")
+            console.print(f"[error]Warning: Could not decode {cue_path}[/]")
             return None
 
     except OSError as e:
-        print(f"  WARNING: Could not read {cue_path}: {e}")
+        console.print(f"[error]Warning: Could not read {cue_path}: {e}[/]")
         return None
 
     album_title = ""
@@ -175,46 +176,92 @@ def parse_cue_file(cue_path: Path) -> CueSheet | None:
     )
 
 
+def looks_like_track_file(filename: str) -> bool:
+    """Check if a FLAC filename looks like an individual track (vs full album)."""
+    # Common track naming patterns: "01.", "01 -", "Track 01", etc.
+    track_patterns = [
+        r'^\d{1,2}\.',  # Starts with 1-2 digits and a period
+        r'^\d{1,2}\s*-',  # Starts with 1-2 digits and a dash
+        r'^Track\s*\d+',  # Starts with "Track" followed by number
+        r'^\d{1,2}\s+\w+',  # Starts with 1-2 digits and space then word
+    ]
+    for pattern in track_patterns:
+        if re.match(pattern, filename, re.IGNORECASE):
+            return True
+    return False
+
+
 def find_flac_cue_pairs(directory: Path) -> list[tuple[Path, Path]]:
     """Recursively find all FLAC + CUE file pairs in a directory."""
     pairs: list[tuple[Path, Path]] = []
 
-    # Find all CUE files
+    # Group CUE files by directory
+    cue_by_dir: dict[Path, list[Path]] = {}
     for cue_path in directory.rglob("*.cue"):
         cue_dir = cue_path.parent
-        cue_stem = cue_path.stem
+        if cue_dir not in cue_by_dir:
+            cue_by_dir[cue_dir] = []
+        cue_by_dir[cue_dir].append(cue_path)
 
-        # Look for matching FLAC file (same name or referenced in CUE)
-        flac_candidates = [
-            cue_dir / f"{cue_stem}.flac",
-            cue_dir / f"{cue_stem}.FLAC",
-        ]
+    # Process each directory
+    for cue_dir, cue_files in cue_by_dir.items():
+        # If multiple CUE files, prioritize ones with 'flac' in filename
+        if len(cue_files) > 1:
+            flac_cues = [c for c in cue_files if 'flac' in c.name.lower()]
+            if flac_cues:
+                cue_files = flac_cues
+            else:
+                # Warn and use first
+                try:
+                    rel_path = cue_dir.resolve().relative_to(directory.resolve())
+                except ValueError:
+                    rel_path = cue_dir.name
+                cue_names = ", ".join(c.name for c in cue_files)
+                console.print(f"[info]Warning: Multiple CUE files in '{rel_path}/'[/]")
+                console.print(f"[info]  Found: {cue_names}[/]")
+                console.print(f"[info]  Using: {cue_files[0].name}[/]")
+                cue_files = [cue_files[0]]
 
-        # Also check all FLAC files in the same directory
-        flac_files = list(cue_dir.glob("*.flac")) + list(cue_dir.glob("*.FLAC"))
+        # Find FLAC files in directory, excluding files that look like individual tracks
+        all_flac_files = list(cue_dir.glob("*.flac")) + list(cue_dir.glob("*.FLAC"))
+        album_flac_files = [f for f in all_flac_files if not looks_like_track_file(f.name)]
 
-        flac_path = None
+        for cue_path in cue_files:
+            cue_stem = cue_path.stem
+            flac_path = None
 
-        # First try exact name match
-        for candidate in flac_candidates:
-            if candidate.exists():
-                flac_path = candidate
-                break
+            # First try exact name match (CUE and FLAC have same stem)
+            # Skip if it looks like an individual track file
+            exact_match = cue_dir / f"{cue_stem}.flac"
+            if exact_match.exists() and not looks_like_track_file(exact_match.name):
+                flac_path = exact_match
+            else:
+                exact_match = cue_dir / f"{cue_stem}.FLAC"
+                if exact_match.exists() and not looks_like_track_file(exact_match.name):
+                    flac_path = exact_match
 
-        # If no exact match, try to find from CUE content
-        if not flac_path:
-            cue_sheet = parse_cue_file(cue_path)
-            if cue_sheet and cue_sheet.file_name:
-                referenced_flac = cue_dir / cue_sheet.file_name
-                if referenced_flac.exists():
-                    flac_path = referenced_flac
+            # If no exact match, try to find from CUE content
+            # Skip if the referenced file looks like an individual track
+            if not flac_path:
+                cue_sheet = parse_cue_file(cue_path)
+                if cue_sheet and cue_sheet.file_name:
+                    referenced_flac = cue_dir / cue_sheet.file_name
+                    if referenced_flac.exists() and not looks_like_track_file(referenced_flac.name):
+                        flac_path = referenced_flac
 
-        # If still no match and there's only one FLAC in the directory, use it
-        if not flac_path and len(flac_files) == 1:
-            flac_path = flac_files[0]
+            # If still no match, look for album FLAC whose stem is contained in the CUE filename
+            # Only consider files that don't look like individual tracks
+            if not flac_path and album_flac_files:
+                cue_name_lower = cue_path.name.lower()
+                for flac_file in album_flac_files:
+                    flac_stem_lower = flac_file.stem.lower()
+                    # Check if FLAC stem is contained in CUE filename
+                    if flac_stem_lower in cue_name_lower:
+                        flac_path = flac_file
+                        break
 
-        if flac_path:
-            pairs.append((flac_path, cue_path))
+            if flac_path:
+                pairs.append((flac_path, cue_path))
 
     return pairs
 
@@ -223,8 +270,9 @@ def is_already_split(cue_sheet: CueSheet, output_dir: Path) -> bool:
     """Check if all expected track files already exist in the output directory."""
     if not output_dir.exists():
         return False
+    total_tracks = len(cue_sheet.tracks)
     for track in cue_sheet.tracks:
-        expected_file = output_dir / track.safe_filename()
+        expected_file = output_dir / track.safe_filename(total_tracks)
         if not expected_file.exists():
             return False
     return True
@@ -243,6 +291,27 @@ def check_ffmpeg() -> bool:
         return False
 
 
+def get_flac_duration(flac_path: Path) -> float | None:
+    """Get the duration of a FLAC file in seconds using ffprobe."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(flac_path)
+            ],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except (FileNotFoundError, ValueError):
+        pass
+    return None
+
+
 def split_flac(
     flac_path: Path,
     cue_sheet: CueSheet,
@@ -258,11 +327,12 @@ def split_flac(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     tracks = cue_sheet.tracks
+    total_tracks = len(tracks)
     success = 0
     errors = 0
 
     for i, track in enumerate(tracks):
-        output_file = output_dir / track.safe_filename()
+        output_file = output_dir / track.safe_filename(total_tracks)
         start_time = track.start_seconds()
 
         # Determine end time (start of next track, or end of file)
@@ -308,19 +378,29 @@ def path_arg(value: str) -> Path:
     return Path(value).expanduser()
 
 
-def format_duration(tracks: list[Track]) -> str:
-    """Estimate total duration from last track start time."""
+def format_duration_seconds(total_secs: float) -> str:
+    """Format seconds as human-readable duration."""
+    total_secs = int(total_secs)
+    if total_secs < 60:
+        return f"{total_secs}s"
+    mins, secs = divmod(total_secs, 60)
+    if mins >= 60:
+        hrs, mins = divmod(mins, 60)
+        return f"{hrs}h {mins}m {secs}s"
+    return f"{mins}m {secs}s"
+
+
+def format_duration(tracks: list[Track], total_duration: float | None = None) -> str:
+    """Format total duration. Uses actual duration if provided, otherwise estimates from last track."""
+    if total_duration is not None:
+        return format_duration_seconds(total_duration)
     if not tracks:
         return "?"
     last = tracks[-1]
     total_secs = int(last.start_seconds())
     if total_secs < 60:
         return "?"
-    mins, secs = divmod(total_secs, 60)
-    if mins >= 60:
-        hrs, mins = divmod(mins, 60)
-        return f"{hrs}h {mins}m {secs}s"
-    return f"{mins}m {secs}s"
+    return "~" + format_duration_seconds(total_secs)
 
 
 def relative_path(path: Path, base: Path) -> str:
@@ -440,29 +520,42 @@ Examples:
         album = cue_sheet.album_title or "(unknown album)"
         artist = cue_sheet.album_performer or "(unknown artist)"
         n_tracks = len(cue_sheet.tracks)
-        duration = format_duration(cue_sheet.tracks)
+
+        # Get actual FLAC duration for accurate album + last track duration
+        flac_duration = get_flac_duration(flac_path)
+        duration = format_duration(cue_sheet.tracks, flac_duration)
 
         # Use green styling for already-split albums
         if already_split and not args.execute:
             console.print(f"[done]{i:2}. {album}[/]")
-            console.print(f"    [done]{artist} | {n_tracks} tracks | ~{duration}[/]")
+            console.print(f"    [done]{artist} | {n_tracks} tracks | {duration}[/]")
             console.print(f"    [done]{folder}/[/]")
         else:
             console.print(f"[info]{i:2}.[/] [album]{album}[/]")
-            console.print(f"    [artist]{artist}[/] [info]|[/] {n_tracks} tracks [info]|[/] ~{duration}")
+            console.print(f"    [artist]{artist}[/] [info]|[/] {n_tracks} tracks [info]|[/] {duration}")
             console.print(f"    [folder]{folder}/[/]")
 
         if args.verbose:
+            console.print(f"    [info]FLAC: {flac_path.name}[/]")
+            console.print(f"    [info]CUE:  {cue_path.name}[/]")
             tracks = cue_sheet.tracks
+            # Calculate max lengths for alignment
+            max_title_len = max(len(t.title) for t in tracks)
+            max_time_len = max(len(t.start_time) for t in tracks)
             for j, track in enumerate(tracks):
                 # Calculate track duration
                 if j + 1 < len(tracks):
-                    duration_secs = int(tracks[j + 1].start_seconds() - track.start_seconds())
-                    dur_m, dur_s = divmod(duration_secs, 60)
-                    track_dur = f"{dur_m}m {dur_s}s"
+                    duration_secs = tracks[j + 1].start_seconds() - track.start_seconds()
+                    track_dur = format_duration_seconds(duration_secs)
+                elif flac_duration is not None:
+                    # Last track: use FLAC duration to calculate
+                    duration_secs = flac_duration - track.start_seconds()
+                    track_dur = format_duration_seconds(duration_secs)
                 else:
                     track_dur = "?"
-                console.print(f"        [info]{track.number:2}.[/] {track.title} [info]| {track.start_time} | {track_dur}[/]")
+                padded_title = track.title.ljust(max_title_len)
+                padded_time = track.start_time.rjust(max_time_len)
+                console.print(f"        [info]{track.number:2}.[/] {padded_title}  [info]{padded_time}  {track_dur:>8}[/]")
 
         if args.execute and not already_split:
             with Progress(
