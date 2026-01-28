@@ -313,11 +313,14 @@ def format_duration(tracks: list[Track]) -> str:
     if not tracks:
         return "?"
     last = tracks[-1]
-    parts = last.start_time.split(":")
-    mins = int(parts[0])
+    total_secs = int(last.start_seconds())
+    if total_secs < 60:
+        return "?"
+    mins, secs = divmod(total_secs, 60)
     if mins >= 60:
-        return f"{mins // 60}h {mins % 60}m"
-    return f"{mins}m"
+        hrs, mins = divmod(mins, 60)
+        return f"{hrs}h {mins}m {secs}s"
+    return f"{mins}m {secs}s"
 
 
 def relative_path(path: Path, base: Path) -> str:
@@ -439,19 +442,27 @@ Examples:
         n_tracks = len(cue_sheet.tracks)
         duration = format_duration(cue_sheet.tracks)
 
-        # Status badge
+        # Use green styling for already-split albums
         if already_split and not args.execute:
-            status = " [done][done][/]"
+            console.print(f"[done]{i:2}. {album}[/]")
+            console.print(f"    [done]{artist} | {n_tracks} tracks | ~{duration}[/]")
+            console.print(f"    [done]{folder}/[/]")
         else:
-            status = ""
-
-        console.print(f"[info]{i:2}.[/] [album]{album}[/]{status}")
-        console.print(f"    [artist]{artist}[/] [info]|[/] {n_tracks} tracks [info]|[/] ~{duration}")
-        console.print(f"    [folder]{folder}/[/]")
+            console.print(f"[info]{i:2}.[/] [album]{album}[/]")
+            console.print(f"    [artist]{artist}[/] [info]|[/] {n_tracks} tracks [info]|[/] ~{duration}")
+            console.print(f"    [folder]{folder}/[/]")
 
         if args.verbose:
-            for track in cue_sheet.tracks:
-                console.print(f"        [info]{track.number:2}.[/] {track.title}")
+            tracks = cue_sheet.tracks
+            for j, track in enumerate(tracks):
+                # Calculate track duration
+                if j + 1 < len(tracks):
+                    duration_secs = int(tracks[j + 1].start_seconds() - track.start_seconds())
+                    dur_m, dur_s = divmod(duration_secs, 60)
+                    track_dur = f"{dur_m}m {dur_s}s"
+                else:
+                    track_dur = "?"
+                console.print(f"        [info]{track.number:2}.[/] {track.title} [info]| {track.start_time} | {track_dur}[/]")
 
         if args.execute and not already_split:
             with Progress(
