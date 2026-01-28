@@ -557,6 +557,9 @@ Examples:
                 padded_time = track.start_time.rjust(max_time_len)
                 console.print(f"        [info]{track.number:2}.[/] {padded_title}  [info]{padded_time}  {track_dur:>8}[/]")
 
+        # Track if split had errors (to prevent deletion on failure)
+        split_had_errors = False
+
         if args.execute and not already_split:
             with Progress(
                 SpinnerColumn(),
@@ -569,6 +572,7 @@ Examples:
                 task = progress.add_task("Splitting", total=n_tracks)
                 success, errors = split_flac(flac_path, cue_sheet, output_dir, execute=True, progress=progress, task_id=task)
             if errors:
+                split_had_errors = True
                 console.print(f"    [done]{success} tracks[/] [error]({errors} errors)[/]")
             else:
                 console.print(f"    [done]{n_tracks} tracks extracted[/]")
@@ -578,8 +582,17 @@ Examples:
         # Handle --delete
         if args.delete and flac_path.exists():
             if args.execute:
-                flac_path.unlink()
-                console.print(f"    [info]Source deleted[/]")
+                if split_had_errors:
+                    console.print(f"    [error]Source kept due to extraction errors[/]")
+                else:
+                    # Default is Y (delete) for successfully split albums
+                    if args.yes:
+                        response = 'y'
+                    else:
+                        response = console.input("    Delete original FLAC? [Y/n] ").strip().lower()
+                    if response != 'n':
+                        flac_path.unlink()
+                        console.print(f"    [info]Source deleted[/]")
             elif already_split:
                 # Default is Y (delete) for already-split albums
                 if args.yes:
